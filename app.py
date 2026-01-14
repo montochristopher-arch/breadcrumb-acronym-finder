@@ -6,22 +6,28 @@ import pandas as pd
 import streamlit as st
 
 # -------------------------------------------------
-# App configuration
+# Page config
 # -------------------------------------------------
-st.set_page_config(page_title="Breadcrumb Acronym Integrity (Meta-00)", layout="wide")
-
-st.title("Breadcrumb Acronym Integrity Checker (Meta-00)")
-st.caption(
-    "Uploads an Excel breadcrumb file, scans breadcrumb columns (Level 1–11), "
-    "detects acronyms and corrupted acronyms (e.g., SMS → Sms), and returns "
-    "exact Excel cell addresses with fix suggestions."
+st.set_page_config(
+    page_title="Breadcrumb Acronym Finder",
+    page_icon="✅",
+    layout="wide",
 )
+
+# -------------------------------------------------
+# Header (clean + compact)
+# -------------------------------------------------
+st.markdown("## Breadcrumb Acronym Finder")
+st.caption(
+    "Upload an Excel breadcrumb file and scan breadcrumb columns **Level 1–11 (B–L)**. "
+    "Returns **Acronym**, **Cell address**, **Cell value**, and **Breadcrumb**."
+)
+st.divider()
 
 # -------------------------------------------------
 # CONFIG: Expected breadcrumb columns (B–L)
 # -------------------------------------------------
 LEVEL_COLUMNS = [f"Level {i}" for i in range(1, 12)]
-
 EXCEL_COLUMN_MAP = {
     "Level 1": "B", "Level 2": "C", "Level 3": "D", "Level 4": "E",
     "Level 5": "F", "Level 6": "G", "Level 7": "H", "Level 8": "I",
@@ -29,23 +35,19 @@ EXCEL_COLUMN_MAP = {
 }
 
 # -------------------------------------------------
-# Normalize column headers (CRITICAL FIX)
+# Column normalization (CRITICAL)
 # -------------------------------------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     normalized = []
     for c in df.columns:
         s = str(c)
-
         # Replace non-breaking / weird unicode spaces
         s = s.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
-
         # Trim + collapse spaces
         s = s.strip()
         s = re.sub(r"\s+", " ", s)
-
         # Normalize Level headers: Level8 / Level  8 / LEVEL8 → Level 8
         s = re.sub(r"^(Level)\s*(\d+)$", r"Level \2", s, flags=re.IGNORECASE)
-
         normalized.append(s)
 
     df = df.copy()
@@ -53,51 +55,20 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------------------------
-# Acronym detection rules (Meta-00)
+# Acronym rules (your final rules)
 # -------------------------------------------------
 SUBSCRIPT_DIGITS = set("₀₁₂₃₄₅₆₇₈₉")
 SUPERSCRIPT_DIGITS = set("⁰¹²³⁴⁵⁶⁷⁸⁹¹²³")
+
 UNIT_PREFIXES = {"mm", "cm", "km", "nm", "pm", "um", "µm", "μm"}
-
-KNOWN_ACRONYMS = {
-    "SMS", "MMS", "API", "SDK", "CRM", "ERP", "POS", "SKU",
-    "B2B", "B2C", "C2C", "D2C",
-    "AI", "ML", "NLP", "LLM",
-    "SEO", "SEM", "PPC", "KPI", "OKR", "ROI",
-    "UX", "UI", "QA", "SLA", "ETA",
-    "OTP", "PIN", "VPN", "LAN", "WAN", "WIFI", "WIFi", "WiFi",
-    "GPS", "RFID", "NFC", "SIM", "ESIM",
-    "PDF", "CSV", "XML", "JSON",
-    "HR", "IT", "BI",
-}
-
-COMMON_TITLECASE_WORDS = {
-    "And", "Or", "The", "A", "An", "Of", "To", "In", "On", "For", "With",
-    "Home", "Service", "Services", "Product", "Products", "Store", "Stores",
-    "Repair", "Cleaning", "Marketing", "Design", "Support", "Management",
-}
 
 CANDIDATE_TOKEN_REGEX = re.compile(
     r"[A-Za-z0-9₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹¹²³]+(?:[-_/.][A-Za-z0-9₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹¹²³]+)*"
 )
 
-PASCAL_CASE_SHORT = re.compile(r"^[A-Z][a-z]{1,5}$")  # Sms, Api, Crm
-
-# -------------------------------------------------
-# Helper functions
-# -------------------------------------------------
-def build_breadcrumb(row: pd.Series) -> str:
-    parts = []
-    for col in LEVEL_COLUMNS:
-        v = row.get(col)
-        if pd.notna(v):
-            s = str(v).strip()
-            if s:
-                parts.append(s)
-    return " > ".join(parts)
-
 
 def is_camel_case(token: str) -> bool:
+    # Exclude normal TitleCase words like Construction
     if len(token) >= 2 and token[0].isupper() and token[1:].islower():
         return False
     return any(c.islower() for c in token) and any(c.isupper() for c in token)
@@ -112,46 +83,65 @@ def looks_like_unit_prefix_camel(token: str) -> bool:
     return False
 
 
-def is_strong_acronym(token: str) -> bool:
+def is_acronym(token: str) -> bool:
+    """
+    A word is considered an acronym if:
+    - It contains 2+ uppercase letters anywhere (even with lowercase/special chars)
+    - OR it includes at least one uppercase letter AND one digit (3D, 5G, G4S)
+    - OR it includes subscript/superscript + letters (H₂O, m²)
+    - OR it matches unit-prefix CamelCase (mmWave, µmSize)
+    - OR it is CamelCase like iPhone, iPad, eSIM
+    """
     if not token or len(token) < 2:
         return False
 
-    upper_count = sum(c.isupper() for c in token)
+    uppercase_count = sum(1 for c in token if "A" <= c <= "Z")
+    has_upper = uppercase_count > 0
     has_digit = any(c.isdigit() for c in token)
     has_sub_sup = any(c in SUBSCRIPT_DIGITS or c in SUPERSCRIPT_DIGITS for c in token)
+    has_letter = any(c.isalpha() for c in token)
 
-    if token.upper() in KNOWN_ACRONYMS:
+    # 1) 2+ uppercase letters anywhere
+    if uppercase_count >= 2:
         return True
-    if upper_count >= 2:
+
+    # 2) Uppercase + digit
+    if has_upper and has_digit:
         return True
-    if any(c.isupper() for c in token) and has_digit:
+
+    # 3) Subscript/superscript + letter
+    if has_sub_sup and has_letter:
         return True
-    if has_sub_sup:
-        return True
+
+    # 4) Unit prefix CamelCase (mmWave)
     if looks_like_unit_prefix_camel(token):
         return True
+
+    # 5) CamelCase (iPhone, eSIM)
     if is_camel_case(token):
         return True
 
     return False
 
 
-def is_corrupted_acronym(token: str, token_upper_seen: Counter) -> bool:
-    if token in COMMON_TITLECASE_WORDS:
-        return False
-    if not PASCAL_CASE_SHORT.match(token):
-        return False
-    if token.upper() in KNOWN_ACRONYMS:
-        return True
-    if token_upper_seen[token.upper()] > 0 and token != token.upper():
-        return True
-    return False
-
-
-def extract_tokens(text: str):
+def extract_acronyms(text: str):
     if not isinstance(text, str):
         return []
-    return CANDIDATE_TOKEN_REGEX.findall(text)
+    tokens = CANDIDATE_TOKEN_REGEX.findall(text)
+    return [t for t in tokens if is_acronym(t)]
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def build_breadcrumb(row: pd.Series) -> str:
+    parts = []
+    for col in LEVEL_COLUMNS:
+        v = row.get(col)
+        if pd.notna(v):
+            s = str(v).strip()
+            if s:
+                parts.append(s)
+    return " > ".join(parts)
 
 # -------------------------------------------------
 # Core analysis
@@ -160,25 +150,18 @@ def analyze_file(df: pd.DataFrame):
     missing = [c for c in LEVEL_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(
-            f"Missing breadcrumb columns.\n"
-            f"Expected: Level 1 to Level 11\n"
-            f"Missing: {missing}\n"
-            f"Found: {list(df.columns)}"
+            f"Missing breadcrumb columns.\nExpected: Level 1 to Level 11\nMissing: {missing}\nFound: {list(df.columns)}"
         )
 
-    token_upper_seen = Counter()
+    rows_scanned = 0
+    cells_scanned = 0
 
-    for _, row in df.iterrows():
-        for col in LEVEL_COLUMNS:
-            v = row.get(col)
-            if pd.notna(v):
-                for t in extract_tokens(str(v)):
-                    token_upper_seen[t.upper()] += 1
-
-    detected, corrupted = [], []
+    out_rows = []
+    acronym_counter = Counter()
 
     for idx, row in df.iterrows():
-        row_num = idx + 2
+        rows_scanned += 1
+        excel_row = idx + 2  # header in row 1
         breadcrumb = build_breadcrumb(row)
 
         for col in LEVEL_COLUMNS:
@@ -190,80 +173,115 @@ def analyze_file(df: pd.DataFrame):
             if not cell_value:
                 continue
 
-            cell_address = f"{EXCEL_COLUMN_MAP[col]}{row_num}"
+            cells_scanned += 1
+            cell_address = f"{EXCEL_COLUMN_MAP[col]}{excel_row}"
 
-            for token in extract_tokens(cell_value):
-                if is_strong_acronym(token):
-                    detected.append({
-                        "term": token,
-                        "cell_address": cell_address,
-                        "cell_value": cell_value,
-                        "breadcrumb": breadcrumb
-                    })
+            acronyms = extract_acronyms(cell_value)
+            if not acronyms:
+                continue
 
-                if is_corrupted_acronym(token, token_upper_seen):
-                    corrupted.append({
-                        "corrupted_term": token,
-                        "suggested_fix": token.upper(),
-                        "cell_address": cell_address,
-                        "cell_value": cell_value,
-                        "breadcrumb": breadcrumb
-                    })
+            for a in acronyms:
+                acronym_counter[a] += 1
+                out_rows.append({
+                    "acronym": a,
+                    "cell_address": cell_address,
+                    "cell_value": cell_value,
+                    "breadcrumb": breadcrumb
+                })
 
-    detected_df = pd.DataFrame(detected).drop_duplicates(["term", "cell_address"])
-    corrupted_df = pd.DataFrame(corrupted).drop_duplicates(["corrupted_term", "cell_address"])
+    instances_df = pd.DataFrame(out_rows)
+    if not instances_df.empty:
+        instances_df = instances_df.drop_duplicates(subset=["acronym", "cell_address"])
 
-    detected_summary = pd.DataFrame(
-        Counter(detected_df["term"]).most_common(),
-        columns=["term", "count"]
-    ) if not detected_df.empty else pd.DataFrame(columns=["term", "count"])
+    summary_df = pd.DataFrame(
+        acronym_counter.most_common(),
+        columns=["acronym", "count"]
+    )
 
-    corrupted_summary = pd.DataFrame(
-        Counter(corrupted_df["corrupted_term"]).most_common(),
-        columns=["corrupted_term", "count"]
-    ) if not corrupted_df.empty else pd.DataFrame(columns=["corrupted_term", "count"])
+    metrics = {
+        "rows_scanned": rows_scanned,
+        "cells_scanned": cells_scanned,
+        "unique_acronyms": int(summary_df.shape[0]),
+        "unique_instances": int(instances_df.shape[0]),
+    }
 
-    return detected_summary, detected_df, corrupted_summary, corrupted_df
+    return summary_df, instances_df, metrics
 
 # -------------------------------------------------
-# UI
+# Sidebar controls
 # -------------------------------------------------
-uploaded_file = st.file_uploader("Upload your breadcrumb Excel file (.xlsx)", type=["xlsx"])
+with st.sidebar:
+    st.subheader("Controls")
+    uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+    run = st.button("Run scan", type="primary", use_container_width=True)
 
-if uploaded_file:
-    try:
-        df = pd.read_excel(uploaded_file)
-        df = normalize_columns(df)
+    with st.expander("What counts as an acronym"):
+        st.markdown(
+            "- Two or more uppercase letters anywhere (e.g., **WiFi**, **USB**)\n"
+            "- Uppercase + digit (e.g., **5G**, **3D**, **G4S**)\n"
+            "- Subscript/superscript (e.g., **H₂O**, **m²**)\n"
+            "- Unit-prefix CamelCase (e.g., **mmWave**, **µmSize**)\n"
+            "- CamelCase terms (e.g., **iPhone**, **iPad**, **eSIM**)"
+        )
 
-        if st.button("Analyze file"):
-            ds, ddf, cs, cdf = analyze_file(df)
+# -------------------------------------------------
+# Main flow
+# -------------------------------------------------
+if not uploaded_file:
+    st.info("Step 1: Upload your Excel file from the sidebar.")
+    st.stop()
 
-            st.success(f"Done. Corruptions found: {len(cdf)} | Terms detected: {len(ddf)}")
+try:
+    df_raw = pd.read_excel(uploaded_file)
+    df = normalize_columns(df_raw)
+except Exception as e:
+    st.error(f"Could not read the Excel file. Details: {e}")
+    st.stop()
 
-            st.subheader("Corrupted acronyms (must fix)")
-            st.dataframe(cs, use_container_width=True, height=250)
-            st.dataframe(cdf, use_container_width=True, height=450)
+with st.expander("Preview uploaded data"):
+    st.write(f"Columns detected: {len(df.columns)}")
+    st.dataframe(df.head(15), use_container_width=True)
 
-            st.subheader("Detected acronyms / special terms")
-            st.dataframe(ds, use_container_width=True, height=250)
-            st.dataframe(ddf, use_container_width=True, height=450)
+if not run:
+    st.info("Click **Run scan** in the sidebar to analyze the file.")
+    st.stop()
 
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                cs.to_excel(writer, index=False, sheet_name="Corruption_Summary")
-                cdf.to_excel(writer, index=False, sheet_name="Corruptions")
-                ds.to_excel(writer, index=False, sheet_name="Detected_Summary")
-                ddf.to_excel(writer, index=False, sheet_name="Detected_Terms")
-            output.seek(0)
+try:
+    with st.spinner("Analyzing…"):
+        summary_df, instances_df, metrics = analyze_file(df)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
-            st.download_button(
-                "Download results (Excel)",
-                output,
-                "breadcrumb_acronym_integrity_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+# Metrics row
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Rows scanned", f"{metrics['rows_scanned']:,}")
+m2.metric("Cells scanned", f"{metrics['cells_scanned']:,}")
+m3.metric("Unique acronyms", f"{metrics['unique_acronyms']:,}")
+m4.metric("Unique instances", f"{metrics['unique_instances']:,}")
 
-    except Exception as e:
-        st.error(str(e))
-else:
-    st.info("Upload an Excel (.xlsx) breadcrumb file to begin.")
+st.divider()
+
+tab1, tab2 = st.tabs(["📍 Instances", "⬇️ Download"])
+
+with tab1:
+    st.subheader("Acronyms with cell addresses")
+    st.dataframe(instances_df, use_container_width=True, height=650)
+
+with tab2:
+    st.subheader("Download results")
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        instances_df.to_excel(writer, index=False, sheet_name="Instances")
+    output.seek(0)
+
+    st.download_button(
+        "Download results (Excel)",
+        data=output,
+        file_name="breadcrumb_acronyms_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
